@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_SCHEMA:aisly}
+    username: ${DB_USER:aisly}
+    password: ${DB_PASSWORD:aisly}
+  jpa:
+    hibernate:
+      ddl-auto: update
+  web:
+    error:
+      include-binding-errors: always
+      include-stacktrace: on_param
+      include-exception: true

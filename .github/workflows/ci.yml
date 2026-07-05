@@ -1,0 +1,188 @@
+name: ci
+
+# The AuthServer and the aisly-backend live in separate repositories but share
+# the SAME AWS infrastructure (one EC2 running a Docker Compose stack, one S3
+# deploy bucket) provisioned by Terraform in the aisly-backend repo. Terraform
+# provisions once; each repo's CI redeploys ONLY its own jar to that shared
+# infra — this workflow uploads authserver.jar to the shared bucket and
+# restarts the `auth` container via SSM. There is no shared pipeline.
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: aisly
+  AUTH_PORT: "8080"
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      deploy_environment: ${{ steps.policy.outputs.deploy_environment }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        shell: bash
+        run: |
+          VERSION="$(grep -E '^version = ' build.gradle.kts | sed -E 's/version = "([^"]+)"/\1/')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - id: policy
+        shell: bash
+        run: |
+          TARGET="${{ github.base_ref || github.ref_name }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          # develop accepts x.y.z-SNAPSHOT or x.y.z-n-SNAPSHOT; main needs a closed x.y.z.
+          if [[ "$TARGET" == "develop" ]]; then
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?-SNAPSHOT$ ]] || {
+              echo "develop requires x.y.z[-n]-SNAPSHOT, got $VERSION"; exit 1;
+            }
+            echo "deploy_environment=dev" >> "$GITHUB_OUTPUT"
+          elif [[ "$TARGET" == "main" ]]; then
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "main requires x.y.z, got $VERSION"; exit 1;
+            }
+            echo "deploy_environment=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_environment=none" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-test:
+    runs-on: ubuntu-latest
+    needs: validate-version
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
+      # Tests run on the H2 `local` profile — no database service needed.
+      - run: ./gradlew --no-daemon clean test bootJar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: authserver-${{ needs.validate-version.outputs.version }}
+          path: build/libs/authserver-${{ needs.validate-version.outputs.version }}.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [validate-version, build-test]
+    # Deploy only on merged/pushed code — PRs run build-test but never touch an environment.
+    if: github.event_name == 'push' && needs.validate-version.outputs.deploy_environment != 'none'
+    environment: ${{ needs.validate-version.outputs.deploy_environment }}
+    concurrency:
+      group: aisly-${{ needs.validate-version.outputs.deploy_environment }}-authserver-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: authserver-${{ needs.validate-version.outputs.version }}
+          path: build/libs
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Resolve EC2 deployment targets
+        id: targets
+        shell: bash
+        run: |
+          DEPLOY_ENV="${{ needs.validate-version.outputs.deploy_environment }}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="${PROJECT}-${DEPLOY_ENV}-deploy-${ACCOUNT_ID}-${AWS_REGION}"
+          INSTANCE_ID="$(
+            aws ec2 describe-instances \
+              --filters \
+                "Name=tag:Project,Values=${PROJECT}" \
+                "Name=tag:Environment,Values=${DEPLOY_ENV}" \
+                "Name=tag:Name,Values=${PROJECT}-${DEPLOY_ENV}-app" \
+                "Name=instance-state-name,Values=running" \
+              --query 'Reservations[].Instances[].InstanceId | [0]' \
+              --output text
+          )"
+
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+            echo "No running ${PROJECT}-${DEPLOY_ENV}-app EC2 instance found." >&2
+            exit 1
+          fi
+
+          echo "bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+      - name: Upload authserver artifact
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          ARTIFACT_KEY="artifacts/authserver/${VERSION}/authserver.jar"
+          aws s3 cp \
+            "build/libs/authserver-${VERSION}.jar" \
+            "s3://${{ steps.targets.outputs.bucket }}/${ARTIFACT_KEY}"
+          echo "ARTIFACT_KEY=${ARTIFACT_KEY}" >> "$GITHUB_ENV"
+      - name: Restart EC2 Docker Compose AuthServer
+        shell: bash
+        run: |
+          cat > ssm-parameters.json <<JSON
+          {
+            "commands": [
+              "set -eu",
+              "aws s3 cp s3://${{ steps.targets.outputs.bucket }}/${ARTIFACT_KEY} /opt/aisly/authserver.jar --region ${AWS_REGION}",
+              "cd /opt/aisly",
+              "/usr/local/bin/docker-compose up -d --force-recreate auth",
+              "sleep 20",
+              "/usr/local/bin/docker-compose ps",
+              "curl --fail --silent http://localhost:${AUTH_PORT}/api/healthcheck"
+            ]
+          }
+          JSON
+
+          COMMAND_ID="$(
+            aws ssm send-command \
+              --instance-ids "${{ steps.targets.outputs.instance_id }}" \
+              --document-name AWS-RunShellScript \
+              --parameters file://ssm-parameters.json \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          for _ in {1..60}; do
+            STATUS="$(
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "${{ steps.targets.outputs.instance_id }}" \
+                --query 'Status' \
+                --output text 2>/dev/null || true
+            )"
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "${{ steps.targets.outputs.instance_id }}" \
+                  --query '{stdout:StandardOutputContent,stderr:StandardErrorContent}' \
+                  --output json
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "${{ steps.targets.outputs.instance_id }}" \
+                  --query '{status:Status,stdout:StandardOutputContent,stderr:StandardErrorContent}' \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for SSM command ${COMMAND_ID}." >&2
+          exit 1

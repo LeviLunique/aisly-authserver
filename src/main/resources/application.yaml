@@ -1,0 +1,35 @@
+spring:
+  config:
+    import: "optional:classpath:security.yaml,optional:file:./security.yaml"
+  application:
+    name: authserver
+  web:
+    error:
+      whitelabel:
+        enabled: false
+      include-message: always
+
+server:
+  servlet:
+    context-path: /api
+
+springdoc:
+  swagger-ui:
+    use-root-path: true
+
+aisly:
+  base-url: ${AISLY_BASE_URL:}
+  internal-secret: ${AISLY_INTERNAL_WEBHOOK_SECRET:}
+  bootstrap:
+    admin-email: ${AISLY_BOOTSTRAP_ADMIN_EMAIL:}
+    admin-password: ${AISLY_BOOTSTRAP_ADMIN_PASSWORD:}
+
+security:
+  issuer: ${AISLY_SECURITY_ISSUER:Aisly AuthServer}
+  secret: ${AISLY_SECURITY_HMAC_SECRET}
+  expireHours: ${AISLY_SECURITY_EXPIRE_HOURS:48}
+  adminExpireHours: ${AISLY_SECURITY_ADMIN_EXPIRE_HOURS:1}
+
+logging:
+  file:
+    path: ./logs

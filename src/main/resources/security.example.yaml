@@ -1,0 +1,5 @@
+security:
+  issuer: "Aisly AuthServer"
+  secret: "${AISLY_SECURITY_HMAC_SECRET}"
+  expireHours: 48
+  adminExpireHours: 1
