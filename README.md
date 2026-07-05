@@ -18,10 +18,6 @@ texto puro) e **webhook de exclusão de conta** para o aisly-backend. Segue o
 padrão da disciplina — **JPA + perfis Spring**: `local` roda em **H2** em memória
 (nenhum banco necessário) e `dev` persiste em **PostgreSQL**.
 
-## Integrantes
-
-- Levi Lunique <!-- ajuste nome completo/RA conforme necessário -->
-
 ## Papel no ecossistema Aisly
 
 ```
